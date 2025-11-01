@@ -1,45 +1,46 @@
 #!/bin/bash
 # =========================================================
-# 🐝 Temporary Fix Script for [Errno 111] Connection Refused
-# Author: The Ghost Area / Gensyn Temp Fix
+# 🧠 GENSYN TEMP FIX SCRIPT
+# Replaces rgym_exp/src/manager.py with updated version
+# Author: The Ghost Area
 # =========================================================
 
-echo ""
-echo "🔧 Starting temporary fix for rl-swarm connection issue..."
-echo "---------------------------------------------------------"
+set -e
 
-# Step 1: Go to rl-swarm directory
+echo ""
+echo "⚙️ Starting Gensyn temporary fix..."
+echo "-----------------------------------"
+
+# Ensure rl-swarm exists
 if [ ! -d "rl-swarm" ]; then
   echo "❌ rl-swarm directory not found!"
   echo "➡️  Please run this script from the parent directory where 'rl-swarm' folder exists."
   exit 1
 fi
 
-cd rl-swarm || exit
-echo "📂 Changed directory to $(pwd)"
+cd rl-swarm
 
-# Step 2: Update node
+# Update the repo (optional)
 echo ""
-echo "🪄 Updating your rl-swarm node..."
-git stash >/dev/null 2>&1
-git pull || { echo "❌ Git pull failed! Check your network or branch."; exit 1; }
+echo "🪄 Pulling latest rl-swarm updates..."
+git stash >/dev/null 2>&1 || true
+git pull || echo "⚠️ Git pull failed — continuing anyway."
 
-# Step 3: Remove old manager.py
-TARGET_FILE="rgym_exp/src/manager.py"
-if [ -f "$TARGET_FILE" ]; then
+# Ensure target folder exists
+mkdir -p rgym_exp/src
+
+# Remove old manager.py
+if [ -f rgym_exp/src/manager.py ]; then
   echo ""
-  echo "🗑️  Removing old manager.py..."
-  sudo rm "$TARGET_FILE"
-else
-  echo ""
-  echo "⚠️  manager.py not found, skipping removal."
+  echo "🗑️ Removing old manager.py..."
+  rm rgym_exp/src/manager.py
 fi
 
-# Step 4: Recreate manager.py with fixed version
+# Create new manager.py
 echo ""
-echo "🧩 Recreating manager.py with new fixed code..."
-sudo mkdir -p rgym_exp/src
-sudo tee "$TARGET_FILE" > /dev/null <<'EOF'
+echo "🧩 Creating new manager.py with updated code..."
+
+cat <<'EOF' > rgym_exp/src/manager.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
@@ -103,10 +104,12 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         assert isinstance(self.communication, HivemindBackend)
         self.train_timeout = 60 * 60 * 24 * 31  # 1 month
 
+        # Logging Setup
         self.peer_id = self.communication.get_id()
         self.state.peer_id = self.peer_id
         self.animal_name = get_name_from_peer_id(self.peer_id, True)
 
+        # Register peer_id and get current round from the chain
         self.coordinator = coordinator
         self.coordinator.register_peer(self.peer_id)
         round, _ = self.coordinator.get_round_and_stage()
@@ -114,11 +117,14 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
 
         self.communication.step_ = self.state.round
 
+        # enable push to HF if token was provided
         self.hf_token = hf_token
         if self.hf_token not in [None, "None"]:
             self._configure_hf_hub(hf_push_frequency)
 
-        get_logger().info(f"🐱 Hello 🐈 [{get_name_from_peer_id(self.peer_id)}] 🦮 [{self.peer_id}]!")
+        get_logger().info(
+            f"🐱 Hello 🐈 [{get_name_from_peer_id(self.peer_id)}] 🦮 [{self.peer_id}]!"
+        )
         get_logger().info(f"bootnodes: {kwargs.get('bootnodes', [])}")
         get_logger().info(f"Using Model: {self.trainer.model.config.name_or_path}")
 
@@ -130,9 +136,121 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         self.submit_period = 3.0
         self.submitted_this_round = False
 
+        # PRG Game
         self.prg_module = PRGModule(log_dir, **kwargs)
         self.prg_game = self.prg_module.prg_game
+        
         self.bootnodes = kwargs.get('bootnodes', [])
+
+    def _get_total_rewards_by_agent(self):
+        rewards_by_agent = defaultdict(int)
+        for stage in range(self.state.stage):
+            rewards = self.rewards[stage]
+            for agent_id, agent_rewards in rewards.items():
+                for batch_id, batch_rewards in agent_rewards.items():
+                    tot = 0
+                    for generation_rewards in batch_rewards:
+                        tot += sum(generation_rewards)
+                    rewards_by_agent[agent_id] += tot
+        return rewards_by_agent
+
+    def _get_my_rewards(self, signal_by_agent):
+        if len(signal_by_agent) == 0:
+            return 0
+        if self.peer_id in signal_by_agent:
+            my_signal = signal_by_agent[self.peer_id]
+        else:
+            my_signal = 0
+        my_signal = (my_signal + 1) * (my_signal > 0) + my_signal * (my_signal <= 0)
+        return my_signal
+
+    def _try_submit_to_chain(self, signal_by_agent):
+        elapsed_time_hours = (time.time() - self.time_since_submit) / 3600
+        if elapsed_time_hours > self.submit_period:
+            try:
+                self.coordinator.submit_reward(
+                    self.state.round, 0, int(self.batched_signals), self.peer_id
+                )
+                self.batched_signals = 0.0
+                if len(signal_by_agent) > 0:
+                    max_agent, max_signal = max(
+                        signal_by_agent.items(), key=lambda x: x[1]
+                    )
+                else:
+                    max_agent = self.peer_id
+                self.coordinator.submit_winners(
+                    self.state.round, [max_agent], self.peer_id
+                )
+                self.time_since_submit = time.time()
+                self.submitted_this_round = True
+            except Exception as e:
+                get_logger().debug(str(e))
+
+    def _hook_after_rewards_updated(self):
+        try:
+            signal_by_agent = self._get_total_rewards_by_agent()
+            self.batched_signals += self._get_my_rewards(signal_by_agent)
+        except Exception as e:
+            get_logger().debug(f"Error getting total rewards by agent: {e}")
+            signal_by_agent = {}
+        self._try_submit_to_chain(signal_by_agent)
+
+    def _hook_after_round_advanced(self):
+        try:
+            if self.prg_game:
+                prg_history_dict = self.prg_module.prg_history_dict
+                results_dict = self.trainer.play_prg_game_logits(prg_history_dict)
+                self.prg_module.play_prg_game(results_dict, self.peer_id)
+        except Exception:
+            get_logger().info(f"Error playing PRG game, continuing next round")
+
+        self._save_to_hf()
+
+        if not self.submitted_this_round:
+            try:
+                signal_by_agent = self._get_total_rewards_by_agent()
+            except Exception as e:
+                get_logger().debug(f"Error getting total rewards by agent: {e}")
+                signal_by_agent = {}
+            self._try_submit_to_chain(signal_by_agent)
+
+        self.submitted_this_round = False
+        self.agent_block()
+
+    def _hook_after_game(self):
+        self._save_to_hf()
+
+    def _configure_hf_hub(self, hf_push_frequency):
+        username = whoami(token=self.hf_token)["name"]
+        model_name = self.trainer.model.config.name_or_path.split("/")[-1]
+        model_name += "-Gensyn-Swarm"
+        model_name += f"-{self.animal_name}"
+        self.trainer.args.hub_model_id = f"{username}/{model_name}"
+        self.hf_push_frequency = hf_push_frequency
+        get_logger().info("Logging into Hugging Face Hub...")
+        login(self.hf_token)
+
+    def _save_to_hf(self):
+        if (
+            self.hf_token not in [None, "None"]
+            and self.state.round % self.hf_push_frequency == 0
+        ):
+            get_logger().info(f"pushing model to huggingface")
+            try:
+                repo_id = self.trainer.args.hub_model_id
+                self.trainer.model.push_to_hub(
+                    repo_id=repo_id,
+                    token=self.hf_token,
+                    commit_message=f"rl-swarm: round {self.state.round}, agent {self.animal_name}",
+                    tags=[
+                        "rl-swarm","genrl-swarm","grpo","gensyn",f"I am {self.animal_name}",
+                    ],
+                )
+            except Exception:
+                get_logger().exception(
+                    "Failed to push model to the Hugging Face Hub. Try manually pushing later.",
+                    stack_info=True,
+                )
 
     def find_existing_p2pd(self):
         try:
@@ -149,18 +267,76 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             return None
         except:
             return None
+
+    def agent_block(self, check_interval=5.0, log_timeout=10.0, max_check_interval=900):
+        start_time = time.monotonic()
+        fetch_log_time = start_time
+        check_backoff = check_interval
+        reconnect_attempts = 0
+        max_reconnect_attempts = 3
+        initial_peers = self.communication.dht.initial_peers
+        
+        while time.monotonic() - start_time < self.train_timeout:
+            curr_time = time.monotonic()
+            try:
+                _ = self.communication.dht.get_visible_maddrs(latest=True)
+                reconnect_attempts = 0
+            except Exception as e:
+                get_logger().warning(f"P2PD connection lost: {e}")
+                if reconnect_attempts < max_reconnect_attempts:
+                    try:
+                        existing_maddrs = self.find_existing_p2pd()
+                        if existing_maddrs:
+                            host_maddrs = existing_maddrs
+                            client_mode = True
+                            start = False
+                        else:
+                            host_maddrs = ["/ip4/0.0.0.0/tcp/0"]
+                            client_mode = False
+                            start = True
+                        get_logger().info(f"Reconnection attempt {reconnect_attempts + 1}/{max_reconnect_attempts}")
+                        new_dht = DHT(
+                            start=start,
+                            host_maddrs=host_maddrs,
+                            initial_peers=initial_peers + self.bootnodes,
+                            client_mode=client_mode,
+                            use_ipfs=False
+                        )
+                        time.sleep(5)
+                        self.communication.dht = new_dht
+                        get_logger().info("✅ New DHT connection established")
+                    except Exception as reinit_error:
+                        get_logger().warning(f"Connection attempt failed: {reinit_error}")
+                        reconnect_attempts+=1
+                        if reconnect_attempts < max_reconnect_attempts:
+                            time.sleep(check_interval)
+                            continue
+                if reconnect_attempts >= max_reconnect_attempts:
+                    get_logger().warning("Max reconnection attempts reached, continuing without DHT...")
+                    self.state.round += 1
+                    return
+            try:
+                round_num, stage = self.coordinator.get_round_and_stage()
+            except Exception as e:
+                if curr_time - fetch_log_time > log_timeout:
+                    get_logger().debug(f"Could not fetch round/stage: {e}")
+                    fetch_log_time = curr_time
+                time.sleep(check_interval)
+                continue
+            if round_num >= self.state.round:
+                get_logger().info(f"🐝 Joining round: {round_num}")
+                check_backoff = check_interval
+                self.state.round = round_num
+                return
+            else:
+                time.sleep(check_backoff)
+                check_backoff = min(check_backoff * 2, max_check_interval)
+            if round_num == self.max_round - 1:
+                return
+        get_logger().info("Training timed out!")
 EOF
 
 echo ""
-echo "✅ manager.py replaced successfully!"
-echo "🧹 Cleanup complete."
-
+echo "✅ Fix applied successfully!"
+echo "📍 File updated: rl-swarm/rgym_exp/src/manager.py"
 echo ""
-echo "🚀 All done!"
-echo "Now you can rerun your node as usual:"
-echo ""
-echo "  cd ~/rl-swarm"
-echo "  python run.py"
-echo ""
-echo "🐝 Happy Swarming!"
-echo "---------------------------------------------------------"
