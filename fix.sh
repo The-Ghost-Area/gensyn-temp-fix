@@ -1,7 +1,7 @@
 #!/bin/bash
 # =========================================================
 # 🧠 GENSYN TEMP FIX SCRIPT
-# Replaces rgym_exp/src/manager.py with updated version
+# Safely replaces rgym_exp/src/manager.py
 # Author: The Ghost Area
 # =========================================================
 
@@ -14,32 +14,29 @@ echo "-----------------------------------"
 # Ensure rl-swarm exists
 if [ ! -d "rl-swarm" ]; then
   echo "❌ rl-swarm directory not found!"
-  echo "➡️  Please run this script from the parent directory where 'rl-swarm' folder exists."
+  echo "➡️  Run this script from the parent folder where 'rl-swarm' exists."
   exit 1
 fi
 
 cd rl-swarm
 
-# Update the repo (optional)
-echo ""
-echo "🪄 Pulling latest rl-swarm updates..."
+# Optional: Update repo
 git stash >/dev/null 2>&1 || true
 git pull || echo "⚠️ Git pull failed — continuing anyway."
 
 # Ensure target folder exists
 mkdir -p rgym_exp/src
 
-# Remove old manager.py
+# Remove old file
 if [ -f rgym_exp/src/manager.py ]; then
-  echo ""
   echo "🗑️ Removing old manager.py..."
   rm rgym_exp/src/manager.py
 fi
 
-# Create new manager.py
-echo ""
-echo "🧩 Creating new manager.py with updated code..."
+# Write Python code safely
+echo "🧩 Writing new manager.py..."
 
+# 👇 NOTE: Single quotes around EOF prevent bash from interpreting parentheses or $
 cat <<'EOF' > rgym_exp/src/manager.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -115,7 +112,9 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         round, _ = self.coordinator.get_round_and_stage()
         self.state.round = round
 
-        self.communication.step_ = self.state.round
+        self.communication.step_ = (
+            self.state.round
+        )  # initialize communication module to contract's round
 
         # enable push to HF if token was provided
         self.hf_token = hf_token
@@ -132,14 +131,15 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             f.write(get_system_info())
 
         self.batched_signals = 0.0
-        self.time_since_submit = time.time()
-        self.submit_period = 3.0
+        self.time_since_submit = time.time()  # seconds
+        self.submit_period = 3.0  # hours
         self.submitted_this_round = False
 
         # PRG Game
         self.prg_module = PRGModule(log_dir, **kwargs)
         self.prg_game = self.prg_module.prg_game
         
+        # Store bootnodes for reconnection
         self.bootnodes = kwargs.get('bootnodes', [])
 
     def _get_total_rewards_by_agent(self):
@@ -152,6 +152,7 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                     for generation_rewards in batch_rewards:
                         tot += sum(generation_rewards)
                     rewards_by_agent[agent_id] += tot
+
         return rewards_by_agent
 
     def _get_my_rewards(self, signal_by_agent):
@@ -176,8 +177,9 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                     max_agent, max_signal = max(
                         signal_by_agent.items(), key=lambda x: x[1]
                     )
-                else:
+                else:  # if we have no signal_by_agents, just submit ourselves.
                     max_agent = self.peer_id
+
                 self.coordinator.submit_winners(
                     self.state.round, [max_agent], self.peer_id
                 )
@@ -191,6 +193,7 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             signal_by_agent = self._get_total_rewards_by_agent()
             self.batched_signals += self._get_my_rewards(signal_by_agent)
         except Exception as e:
+            # If signal_by_agent is empty, we just submit ourself as winner according to logic in _try_submit_to_chain
             get_logger().debug(f"Error getting total rewards by agent: {e}")
             signal_by_agent = {}
         self._try_submit_to_chain(signal_by_agent)
@@ -201,11 +204,12 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 prg_history_dict = self.prg_module.prg_history_dict
                 results_dict = self.trainer.play_prg_game_logits(prg_history_dict)
                 self.prg_module.play_prg_game(results_dict, self.peer_id)
-        except Exception:
-            get_logger().info(f"Error playing PRG game, continuing next round")
+        except Exception as e:
+            get_logger().info(f"Error playing PRG game, continuing with the next round")
 
         self._save_to_hf()
 
+        # Try to submit to chain again if necessary, but don't update our signal twice
         if not self.submitted_this_round:
             try:
                 signal_by_agent = self._get_total_rewards_by_agent()
@@ -214,7 +218,10 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 signal_by_agent = {}
             self._try_submit_to_chain(signal_by_agent)
 
+        # Reset flag for next round
         self.submitted_this_round = False
+
+        # Block until swarm round advances
         self.agent_block()
 
     def _hook_after_game(self):
@@ -238,27 +245,37 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             get_logger().info(f"pushing model to huggingface")
             try:
                 repo_id = self.trainer.args.hub_model_id
+
                 self.trainer.model.push_to_hub(
                     repo_id=repo_id,
                     token=self.hf_token,
                     commit_message=f"rl-swarm: round {self.state.round}, agent {self.animal_name}",
                     tags=[
-                        "rl-swarm","genrl-swarm","grpo","gensyn",f"I am {self.animal_name}",
+                        "rl-swarm",
+                        "genrl-swarm",
+                        "grpo",
+                        "gensyn",
+                        f"I am {self.animal_name}",
                     ],
                 )
             except Exception:
                 get_logger().exception(
-                    "Failed to push model to the Hugging Face Hub. Try manually pushing later.",
+                    "Failed to push model to the Hugging Face Hub. When you conclude training please try manually pushing it yourself using the instructions here: https://huggingface.co/docs/hub/en/models-uploading",
                     stack_info=True,
                 )
 
     def find_existing_p2pd(self):
+        """Try to find existing p2pd ports"""
         try:
             result = subprocess.run(['ss', '-tlpn'], capture_output=True, text=True)
             output = result.stdout
+            
+            # Look for p2pd in the output
             if 'p2pd' in output:
+                # Extract the ports
                 tcp_match = re.search(r'.*:(\d+).*p2pd.*tcp', output)
                 udp_match = re.search(r'.*:(\d+).*p2pd.*udp', output)
+                
                 if tcp_match and udp_match:
                     return [
                         f"/ip4/0.0.0.0/tcp/{tcp_match.group(1)}",
@@ -268,12 +285,16 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         except:
             return None
 
-    def agent_block(self, check_interval=5.0, log_timeout=10.0, max_check_interval=900):
+    def agent_block(
+        self, check_interval=5.0, log_timeout=10.0, max_check_interval=60.0 * 15
+    ):
         start_time = time.monotonic()
         fetch_log_time = start_time
         check_backoff = check_interval
         reconnect_attempts = 0
         max_reconnect_attempts = 3
+        
+        # Store initial configuration
         initial_peers = self.communication.dht.initial_peers
         
         while time.monotonic() - start_time < self.train_timeout:
@@ -282,18 +303,26 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 _ = self.communication.dht.get_visible_maddrs(latest=True)
                 reconnect_attempts = 0
             except Exception as e:
-                get_logger().warning(f"P2PD connection lost: {e}")
+                get_logger().warning(f"P2PD connection lost at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                get_logger().warning(f"Error details: {str(e)}")
+                
                 if reconnect_attempts < max_reconnect_attempts:
                     try:
+                        # Check for existing p2pd first
                         existing_maddrs = self.find_existing_p2pd()
+                        
                         if existing_maddrs:
+                            get_logger().info(f"Found existing p2pd ports, attempting to connect...")
                             host_maddrs = existing_maddrs
                             client_mode = True
                             start = False
                         else:
+                            get_logger().info(f"No existing p2pd found, creating new instance...")
                             host_maddrs = ["/ip4/0.0.0.0/tcp/0"]
                             client_mode = False
                             start = True
+                        
+                        # Try to reconnect
                         get_logger().info(f"Reconnection attempt {reconnect_attempts + 1}/{max_reconnect_attempts}")
                         new_dht = DHT(
                             start=start,
@@ -302,37 +331,50 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                             client_mode=client_mode,
                             use_ipfs=False
                         )
+                        
                         time.sleep(5)
                         self.communication.dht = new_dht
-                        get_logger().info("✅ New DHT connection established")
+                        get_logger().info("Successfully created new DHT connection")
                     except Exception as reinit_error:
-                        get_logger().warning(f"Connection attempt failed: {reinit_error}")
-                        reconnect_attempts+=1
+                        get_logger().warning(f"Connection attempt {reconnect_attempts + 1} failed: {reinit_error}")
+                        reconnect_attempts += 1
                         if reconnect_attempts < max_reconnect_attempts:
+                            get_logger().info(f"Retrying in {check_interval} seconds...")
                             time.sleep(check_interval)
                             continue
+                
                 if reconnect_attempts >= max_reconnect_attempts:
                     get_logger().warning("Max reconnection attempts reached, continuing without DHT...")
                     self.state.round += 1
                     return
+
+            # Retrieve current round and stage
             try:
                 round_num, stage = self.coordinator.get_round_and_stage()
             except Exception as e:
                 if curr_time - fetch_log_time > log_timeout:
-                    get_logger().debug(f"Could not fetch round/stage: {e}")
+                    get_logger().debug(
+                        f"Could not fetch round and stage: {e}. Next check in {check_interval}s."
+                    )
                     fetch_log_time = curr_time
                 time.sleep(check_interval)
                 continue
+
             if round_num >= self.state.round:
                 get_logger().info(f"🐝 Joining round: {round_num}")
                 check_backoff = check_interval
                 self.state.round = round_num
                 return
             else:
+                get_logger().info(
+                    f"Already finished round: {round_num}. Next check in {check_backoff}s."
+                )
                 time.sleep(check_backoff)
                 check_backoff = min(check_backoff * 2, max_check_interval)
+
             if round_num == self.max_round - 1:
                 return
+
         get_logger().info("Training timed out!")
 EOF
 
