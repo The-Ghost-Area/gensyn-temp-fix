@@ -1,8 +1,8 @@
 #!/bin/bash
 # =========================================================
-# 🧠 GENSYN TEMP FIX SCRIPT (Auto-detect version)
-# Automatically replaces rgym_exp/src/manager.py with fixed version
-# Author: The Ghost Area
+# 🧠 GENSYN TEMP FIX SCRIPT (Smart Auto-detect version)
+# Automatically finds and fixes rl-swarm from any directory
+# Author: The Ghost Area (Enhanced)
 # =========================================================
 
 set -e
@@ -11,17 +11,68 @@ echo ""
 echo "⚙️ Starting Gensyn temporary fix..."
 echo "-----------------------------------"
 
-# --- Auto-detect rl-swarm directory ---
-if [ -d "rl-swarm" ]; then
-    cd rl-swarm
-    echo "📁 Entered rl-swarm directory."
-elif [ -f "README.md" ] && grep -qi "rl-swarm" README.md 2>/dev/null; then
-    echo "📍 Already inside rl-swarm."
-else
-    echo "❌ Couldn't detect rl-swarm folder!"
-    echo "➡️  Please make sure you're in or above the rl-swarm project folder."
+# Function to find rl-swarm directory
+find_rl_swarm() {
+    local current_dir="$PWD"
+    local search_dirs=(
+        "$current_dir"                          # Current directory
+        "$current_dir/rl-swarm"                 # Direct subdirectory
+        "$current_dir/../rl-swarm"              # Parent's subdirectory
+        "$current_dir/../../rl-swarm"           # Grandparent's subdirectory
+        "$HOME/rl-swarm"                        # Home directory
+    )
+    
+    # Check predefined locations first
+    for dir in "${search_dirs[@]}"; do
+        if [ -d "$dir" ] && [ -d "$dir/rgym_exp" ]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+    
+    # If not found, search recursively (up to 3 levels deep)
+    echo "🔍 Searching for rl-swarm directory..." >&2
+    local found_dir=$(find "$current_dir" -maxdepth 3 -type d -name "rl-swarm" 2>/dev/null | head -n 1)
+    
+    if [ -n "$found_dir" ] && [ -d "$found_dir/rgym_exp" ]; then
+        echo "$found_dir"
+        return 0
+    fi
+    
+    # Search in parent directories
+    found_dir=$(find "$current_dir/.." -maxdepth 3 -type d -name "rl-swarm" 2>/dev/null | head -n 1)
+    if [ -n "$found_dir" ] && [ -d "$found_dir/rgym_exp" ]; then
+        echo "$found_dir"
+        return 0
+    fi
+    
+    # Search in home directory
+    found_dir=$(find "$HOME" -maxdepth 4 -type d -name "rl-swarm" 2>/dev/null | head -n 1)
+    if [ -n "$found_dir" ] && [ -d "$found_dir/rgym_exp" ]; then
+        echo "$found_dir"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Try to find rl-swarm directory
+RL_SWARM_DIR=$(find_rl_swarm)
+
+if [ -z "$RL_SWARM_DIR" ]; then
+    echo ""
+    echo "❌ Could not find rl-swarm directory!"
+    echo "➡️  Please ensure rl-swarm is cloned in an accessible location."
+    echo ""
+    echo "💡 Quick fix:"
+    echo "   cd ~"
+    echo "   git clone https://github.com/gensyn-ai/rl-swarm.git"
+    echo "   bash fix.sh"
     exit 1
 fi
+
+echo "✅ Found rl-swarm at: $RL_SWARM_DIR"
+cd "$RL_SWARM_DIR"
 
 # --- Optional: Update repo ---
 if [ -d ".git" ]; then
@@ -391,6 +442,10 @@ EOF
 
 echo ""
 echo "✅ Fix applied successfully!"
-echo "📍 File updated: $(pwd)/rgym_exp/src/manager.py"
+echo "📍 File updated: $RL_SWARM_DIR/rgym_exp/src/manager.py"
+echo ""
+echo "🎯 Usage: Navigate to rl-swarm and run your training command"
+echo "   cd $RL_SWARM_DIR"
+echo "   # then run your training command"
 echo ""
 echo "✨ Done!"
